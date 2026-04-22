@@ -1,0 +1,22 @@
+{
+  "mammals": [
+    "bear",
+    "bobcat",
+    "coyote",
+    "deer",
+    "fox",
+    "raccoon",
+    "skunk",
+    "squirrel"
+  ],
+  "birds": [
+    "owl",
+    "turkey",
+    "woodpecker"
+  ],
+  "other": [
+    "human",
+    "vehicle",
+    "unknown"
+  ]
+}
