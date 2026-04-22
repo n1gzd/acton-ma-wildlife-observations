@@ -143,10 +143,6 @@ def run_labeling_session(
             index += 1
             continue
 
-        if not entry:
-            print("No label entered. Use /skip to move on without labeling.")
-            continue
-
         labels[key] = {
             "label": entry,
             "labeled_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
