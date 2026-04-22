@@ -25,7 +25,8 @@ Defaults:
 - Sampled frames per video: `--frames 6`
 - Confidence threshold: `--conf 0.35`
 - Wind/weather filter: `--min-frames 2` OR `--min-box-area 0.02`
-- Model cache: `~/.cache/wildlife-video-labeler/models/yolov8n.onnx` (auto-downloaded on first run)
+- Model cache: `~/.cache/wildlife-video-labeler/models/yolov5n.onnx` (auto-downloaded on first run)
+- If model checksum validation fails, delete the cached model file and rerun triage to download a fresh copy.
 
 Example with overrides:
 

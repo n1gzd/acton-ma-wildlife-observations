@@ -1,9 +1,7 @@
 import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from tools.wildlife_video_labeler import (
     find_video_files,
@@ -67,14 +65,17 @@ class WildlifeVideoLabelerTests(unittest.TestCase):
             self.assertEqual(relative_key(base, nested), "cam1/clip1.mp4")
 
     def test_parse_args_keeps_legacy_label_mode(self):
-        with patch.object(sys, "argv", ["wildlife_video_labeler.py", "/tmp/input"]):
-            args = parse_args()
+        args = parse_args(["/tmp/input"])
+        self.assertEqual(args.mode, "label")
+        self.assertEqual(args.input_dir, Path("/tmp/input"))
+
+    def test_parse_args_supports_explicit_label_subcommand(self):
+        args = parse_args(["label", "/tmp/input"])
         self.assertEqual(args.mode, "label")
         self.assertEqual(args.input_dir, Path("/tmp/input"))
 
     def test_parse_args_supports_triage_subcommand(self):
-        with patch.object(sys, "argv", ["wildlife_video_labeler.py", "triage", "/tmp/input", "--frames", "4"]):
-            args = parse_args()
+        args = parse_args(["triage", "/tmp/input", "--frames", "4"])
         self.assertEqual(args.mode, "triage")
         self.assertEqual(args.input_dir, Path("/tmp/input"))
         self.assertEqual(args.frames, 4)

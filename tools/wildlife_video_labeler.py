@@ -4,19 +4,28 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import shutil
 import subprocess
+import sys
 import tempfile
 import urllib.request
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Sequence
 
 VIDEO_EXTENSIONS = {".avi", ".mov", ".mp4", ".m4v", ".mts", ".mkv"}
 DEFAULT_MODEL_URL = (
-    "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.onnx"
+    "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.onnx"
 )
-DEFAULT_MODEL_CACHE_PATH = Path("~/.cache/wildlife-video-labeler/models/yolov8n.onnx")
+# SHA256 for yolov5n.onnx from the official Ultralytics v7.0 release URL (verified 2026-04-22).
+DEFAULT_MODEL_SHA256 = "04f0e55c26f58d17145b36045780fe1250d5bd2187543e11568e5141d05b3262"
+DEFAULT_MODEL_CACHE_PATH = Path("~/.cache/wildlife-video-labeler/models/yolov5n.onnx")
+NORMALIZED_COORD_MAX_THRESHOLD = 2.0
+TRUSTED_MODEL_HOSTS = {"github.com", "raw.githubusercontent.com", "objects.githubusercontent.com"}
+VALID_MODES = {"label", "triage"}
 
 COCO_PERSON_CLASSES = {0}
 COCO_VEHICLE_CLASSES = {1, 2, 3, 5, 7}
@@ -107,14 +116,54 @@ def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _ensure_model_file(model_path: Path, model_url: str) -> Path:
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _ensure_model_file(model_path: Path, model_url: str, model_sha256: str) -> Path:
     resolved = model_path.expanduser().resolve()
+    expected_sha = model_sha256.strip().lower()
+    parsed_url = urllib.parse.urlparse(model_url)
+    if parsed_url.scheme != "https":
+        raise ValueError("Model URL must use https://")
+    if parsed_url.hostname not in TRUSTED_MODEL_HOSTS:
+        raise ValueError(f"Model URL host must be one of: {sorted(TRUSTED_MODEL_HOSTS)}")
+
     if resolved.exists():
+        if expected_sha:
+            actual_sha = _sha256_file(resolved)
+            if actual_sha != expected_sha:
+                raise ValueError(
+                    f"Model checksum mismatch at {resolved}: expected {expected_sha}, got {actual_sha}"
+                )
         return resolved
 
     resolved.parent.mkdir(parents=True, exist_ok=True)
     print(f"Downloading model to {resolved} ...")
-    urllib.request.urlretrieve(model_url, resolved)  # nosec: B310 - trusted URL input from CLI.
+    with tempfile.NamedTemporaryFile(dir=resolved.parent, delete=False, suffix=".download") as temp_file:
+        temp_path = Path(temp_file.name)
+    try:
+        urllib.request.urlretrieve(model_url, temp_path)  # nosec: B310 - trusted host allowlist + checksum verification.
+        if expected_sha:
+            actual_sha = _sha256_file(temp_path)
+            if actual_sha != expected_sha:
+                raise ValueError(
+                    f"Downloaded model checksum mismatch: expected {expected_sha}, got {actual_sha}"
+                )
+        shutil.move(str(temp_path), str(resolved))
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
     return resolved
 
 
@@ -231,7 +280,11 @@ class _YoloOnnxDetector:
 
         widths = np.abs(boxes_xywh[keep_indices, 2])
         heights = np.abs(boxes_xywh[keep_indices, 3])
-        if np.max(widths, initial=0.0) <= 2.0 and np.max(heights, initial=0.0) <= 2.0:
+        # Some ONNX exports produce normalized box sizes (~0..1), others use input-pixel units.
+        # Heuristic: sizes <= 2.0 are treated as normalized to tolerate slight overshoot from quantization.
+        max_width = np.max(widths, initial=0.0)
+        max_height = np.max(heights, initial=0.0)
+        if max_width <= NORMALIZED_COORD_MAX_THRESHOLD and max_height <= NORMALIZED_COORD_MAX_THRESHOLD:
             area_ratios = widths * heights
         else:
             area_ratios = (widths * heights) / float(self._input_size * self._input_size)
@@ -285,6 +338,7 @@ def _build_video_triage_record(
             qualified_categories.append(category)
 
     interesting = bool(qualified_categories)
+    # Prefer person > animal > vehicle to surface potential human activity first.
     if "person" in qualified_categories:
         reason = "person_detected"
     elif "animal" in qualified_categories:
@@ -347,6 +401,7 @@ def run_triage_session(
     min_box_area_ratio: float,
     model_path: Path,
     model_url: str,
+    model_sha256: str,
     frame_scale_width: int = 640,
 ) -> int:
     videos = find_video_files(input_dir)
@@ -369,7 +424,7 @@ def run_triage_session(
         )
         return 0
 
-    resolved_model_path = _ensure_model_file(model_path, model_url)
+    resolved_model_path = _ensure_model_file(model_path, model_url, model_sha256)
     detector = _YoloOnnxDetector(resolved_model_path, input_size=frame_scale_width)
 
     print(f"Found {total} videos under {input_dir}")
@@ -406,7 +461,13 @@ def run_triage_session(
                 min_frames=min_frames,
                 min_box_area_ratio=min_box_area_ratio,
             )
-        except Exception as exc:  # pylint: disable=broad-except
+        except (
+            FileNotFoundError,
+            ValueError,
+            RuntimeError,
+            subprocess.CalledProcessError,
+            OSError,
+        ) as exc:
             error_count += 1
             record = {
                 "relative_path": rel,
@@ -431,6 +492,7 @@ def run_triage_session(
         "frame_scale_width": frame_scale_width,
         "model_path": str(resolved_model_path),
         "model_url": model_url,
+        "model_sha256": model_sha256,
     }
     save_triage_reports(
         report_json_path=report_json_path,
@@ -519,88 +581,93 @@ def run_labeling_session(
     return 0
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    args_list = list(argv) if argv is not None else sys.argv[1:]
+    # Backward compatibility: historical usage was `script.py <input_dir>` for labeling.
+    # Keep that behavior by rewriting to explicit `label` subcommand unless `triage` is used.
+    if not args_list:
+        args_list = ["label"]
+    elif args_list[0] not in VALID_MODES and not args_list[0].startswith("-"):
+        args_list = ["label", *args_list]
+
     parser = argparse.ArgumentParser(description="Local-first wildlife video labeling tool")
-    parser.add_argument(
-        "mode",
-        nargs="?",
-        default="label",
-        help="Mode: 'label' (default) or 'triage'. For triage subcommand use: triage <input_dir>",
-    )
-    parser.add_argument("input_dir", nargs="?", type=Path, help="Directory containing raw trail camera videos")
-    parser.add_argument(
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+
+    label_parser = subparsers.add_parser("label", help="Interactive manual labeling mode")
+    label_parser.add_argument("input_dir", type=Path, help="Directory containing raw trail camera videos")
+    label_parser.add_argument(
         "--output-file",
         type=Path,
         default=Path("labels/wildlife-video-labels.json"),
         help="Label mode JSON output (default: labels/wildlife-video-labels.json)",
     )
-    parser.add_argument(
+    label_parser.add_argument(
         "--default-label",
         default="",
         help="Label mode default label to apply when pressing enter on an empty prompt",
     )
-    parser.add_argument(
+    label_parser.add_argument(
         "--label-config",
         type=Path,
         default=Path("config/label-config.json"),
         help="Label mode config JSON (default: config/label-config.json)",
     )
-    parser.add_argument(
+
+    triage_parser = subparsers.add_parser("triage", help="Non-interactive CPU triage mode")
+    triage_parser.add_argument("input_dir", type=Path, help="Directory containing raw trail camera videos")
+    triage_parser.add_argument(
         "--report-json",
         type=Path,
         default=Path("reports/wildlife-video-triage.json"),
         help="Triage mode JSON report path (default: reports/wildlife-video-triage.json)",
     )
-    parser.add_argument(
+    triage_parser.add_argument(
         "--interesting-list",
         type=Path,
         default=Path("reports/interesting-videos.txt"),
         help="Triage mode text file with relative paths of interesting videos",
     )
-    parser.add_argument(
+    triage_parser.add_argument(
         "--frames",
         type=int,
         default=6,
         help="Triage mode number of evenly spaced frames sampled per video (default: 6)",
     )
-    parser.add_argument(
+    triage_parser.add_argument(
         "--conf",
         type=float,
         default=0.35,
         help="Triage mode confidence threshold (default: 0.35)",
     )
-    parser.add_argument(
+    triage_parser.add_argument(
         "--min-frames",
         type=int,
         default=2,
         help="Triage mode minimum sampled frames containing category to qualify (default: 2)",
     )
-    parser.add_argument(
+    triage_parser.add_argument(
         "--min-box-area",
         type=float,
         default=0.02,
         help="Triage mode minimum normalized box area to qualify even if seen in fewer frames (default: 0.02)",
     )
-    parser.add_argument(
+    triage_parser.add_argument(
         "--model-url",
         default=DEFAULT_MODEL_URL,
         help="Triage mode model URL used for first-run download",
     )
-    parser.add_argument(
+    triage_parser.add_argument(
+        "--model-sha256",
+        default=DEFAULT_MODEL_SHA256,
+        help="Triage mode expected SHA256 for downloaded model",
+    )
+    triage_parser.add_argument(
         "--model-path",
         type=Path,
         default=DEFAULT_MODEL_CACHE_PATH,
-        help="Triage mode local ONNX model path (default: ~/.cache/wildlife-video-labeler/models/yolov8n.onnx)",
+        help="Triage mode local ONNX model path (default: ~/.cache/wildlife-video-labeler/models/yolov5n.onnx)",
     )
-    args = parser.parse_args()
-
-    if args.mode != "triage" and args.input_dir is None:
-        args.input_dir = Path(args.mode)
-        args.mode = "label"
-
-    if args.input_dir is None:
-        parser.error("input_dir is required")
-    return args
+    return parser.parse_args(args_list)
 
 
 def main() -> int:
@@ -616,7 +683,7 @@ def main() -> int:
             print("--frames must be > 0")
             return 2
         if args.conf <= 0 or args.conf > 1:
-            print("--conf must be in (0, 1]")
+            print("--conf must be greater than 0 and at most 1")
             return 2
         if args.min_frames <= 0:
             print("--min-frames must be > 0")
@@ -635,6 +702,7 @@ def main() -> int:
             min_box_area_ratio=args.min_box_area,
             model_path=args.model_path,
             model_url=args.model_url,
+            model_sha256=args.model_sha256,
         )
 
     output_file = args.output_file.expanduser().resolve()
