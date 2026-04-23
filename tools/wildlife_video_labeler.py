@@ -32,6 +32,15 @@ COCO_VEHICLE_CLASSES = {1, 2, 3, 5, 7}
 COCO_ANIMAL_CLASSES = {14, 15, 16, 17, 18, 19, 20, 21, 22, 23}
 
 
+def _onnx_tensor_input_dtype(np_module: object, onnx_type: str):
+    dtype_name = {
+        "tensor(float16)": "float16",
+        "tensor(float)": "float32",
+        "tensor(double)": "float64",
+    }.get(onnx_type, "float32")
+    return getattr(np_module, dtype_name, np_module.float32)
+
+
 def find_video_files(input_dir: Path) -> List[Path]:
     return sorted(
         path
@@ -243,13 +252,15 @@ class _YoloOnnxDetector:
             str(model_path),
             providers=["CPUExecutionProvider"],
         )
-        self._input_name = self._session.get_inputs()[0].name
+        input_node = self._session.get_inputs()[0]
+        self._input_name = input_node.name
+        self._input_dtype = _onnx_tensor_input_dtype(np, input_node.type)
 
     def detect(self, image_path: Path, conf_threshold: float) -> List[Dict[str, float | int | str]]:
         np = self._np
         image = self._image_module.open(image_path).convert("RGB").resize((self._input_size, self._input_size))
         array = np.asarray(image, dtype=np.float32) / 255.0
-        tensor = np.transpose(array, (2, 0, 1))[np.newaxis, ...]
+        tensor = np.transpose(array, (2, 0, 1))[np.newaxis, ...].astype(self._input_dtype, copy=False)
 
         output = self._session.run(None, {self._input_name: tensor})[0]
         predictions = np.squeeze(output)
