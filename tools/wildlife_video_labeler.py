@@ -41,6 +41,19 @@ def _onnx_tensor_input_dtype(numpy_module: object, onnx_type: str):
     return getattr(numpy_module, dtype_name, numpy_module.float32)
 
 
+def _compute_area_ratios(widths: Sequence[float], heights: Sequence[float], input_size: int) -> List[float]:
+    width_values = [abs(float(width)) for width in widths]
+    height_values = [abs(float(height)) for height in heights]
+
+    max_width = max(width_values, default=0.0)
+    max_height = max(height_values, default=0.0)
+    if max_width <= NORMALIZED_COORD_MAX_THRESHOLD and max_height <= NORMALIZED_COORD_MAX_THRESHOLD:
+        return [width * height for width, height in zip(width_values, height_values)]
+
+    area_scale = float(input_size * input_size)
+    return [(width * height) / area_scale for width, height in zip(width_values, height_values)]
+
+
 def find_video_files(input_dir: Path) -> List[Path]:
     return sorted(
         path
@@ -289,16 +302,11 @@ class _YoloOnnxDetector:
         if keep_indices.size == 0:
             return []
 
-        widths = np.abs(boxes_xywh[keep_indices, 2])
-        heights = np.abs(boxes_xywh[keep_indices, 3])
+        widths = boxes_xywh[keep_indices, 2]
+        heights = boxes_xywh[keep_indices, 3]
         # Some ONNX exports produce normalized box sizes (~0..1), others use input-pixel units.
         # Heuristic: sizes <= 2.0 are treated as normalized to tolerate slight overshoot from quantization.
-        max_width = np.max(widths, initial=0.0)
-        max_height = np.max(heights, initial=0.0)
-        if max_width <= NORMALIZED_COORD_MAX_THRESHOLD and max_height <= NORMALIZED_COORD_MAX_THRESHOLD:
-            area_ratios = widths * heights
-        else:
-            area_ratios = (widths * heights) / float(self._input_size * self._input_size)
+        area_ratios = _compute_area_ratios(widths=widths, heights=heights, input_size=self._input_size)
 
         detections: List[Dict[str, float | int | str]] = []
         for output_index, keep_index in enumerate(keep_indices):

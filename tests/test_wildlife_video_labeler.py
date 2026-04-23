@@ -1,9 +1,11 @@
 import json
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 from tools.wildlife_video_labeler import (
+    _compute_area_ratios,
     _onnx_tensor_input_dtype,
     find_video_files,
     load_label_config,
@@ -134,6 +136,19 @@ class WildlifeVideoLabelerTests(unittest.TestCase):
         self.assertEqual(_onnx_tensor_input_dtype(_FakeNumpy, "tensor(float)"), "f32")
         self.assertEqual(_onnx_tensor_input_dtype(_FakeNumpy, "tensor(double)"), "f64")
         self.assertEqual(_onnx_tensor_input_dtype(_FakeNumpy, "tensor(uint8)"), "f32")
+
+    def test_compute_area_ratios_avoids_numpy_overflow_warning(self):
+        widths = [1e20]
+        heights = [1e20]
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RuntimeWarning)
+            area_ratios = _compute_area_ratios(widths=widths, heights=heights, input_size=640)
+
+        overflow_warnings = [entry for entry in caught if "overflow" in str(entry.message).lower()]
+        self.assertEqual(overflow_warnings, [])
+        self.assertEqual(len(area_ratios), 1)
+        self.assertGreater(area_ratios[0], 0.0)
 
 
 if __name__ == "__main__":
