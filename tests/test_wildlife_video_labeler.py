@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from tools.wildlife_video_labeler import (
+    _onnx_tensor_input_dtype,
     find_video_files,
     load_label_config,
     load_labels,
@@ -122,6 +123,17 @@ class WildlifeVideoLabelerTests(unittest.TestCase):
             self.assertEqual(payload["interesting_videos"], 1)
             self.assertEqual([video["relative_path"] for video in payload["videos"]], ["a/clip1.mp4", "z/clip3.mp4"])
             self.assertEqual(interesting_list.read_text(encoding="utf-8"), "a/clip1.mp4\n")
+
+    def test_onnx_tensor_input_dtype_maps_known_types(self):
+        class _FakeNumpy:
+            float16 = "f16"
+            float32 = "f32"
+            float64 = "f64"
+
+        self.assertEqual(_onnx_tensor_input_dtype(_FakeNumpy, "tensor(float16)"), "f16")
+        self.assertEqual(_onnx_tensor_input_dtype(_FakeNumpy, "tensor(float)"), "f32")
+        self.assertEqual(_onnx_tensor_input_dtype(_FakeNumpy, "tensor(double)"), "f64")
+        self.assertEqual(_onnx_tensor_input_dtype(_FakeNumpy, "tensor(uint8)"), "f32")
 
 
 if __name__ == "__main__":
