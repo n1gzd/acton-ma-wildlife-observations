@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Local-first wildlife video labeling tool for WSL Ubuntu."""
+"""Local-first wildlife video labeling tool for WSL Ubuntu.
+
+Triage mode uses MegaDetector v5a (YOLOv5-based, 3 classes: animal / person / vehicle)
+exported to ONNX format, running entirely on CPU via onnxruntime.  The ~560 MB model
+is downloaded on first run.  Provide --model-sha256 with your locally verified hash to
+enable integrity checking on subsequent runs.
+"""
 
 from __future__ import annotations
 
@@ -17,19 +23,23 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
 
 VIDEO_EXTENSIONS = {".avi", ".mov", ".mp4", ".m4v", ".mts", ".mkv"}
+# MegaDetector v5a (YOLOv5-based) exported to dynamic ONNX by bencevans/megadetector-onnx v0.1.0.
+# The model accepts any square input size; 1280 matches the training resolution for best accuracy.
+# Note: this model is ~560 MB. Set --model-sha256 to your locally verified hash to enable integrity checking.
 DEFAULT_MODEL_URL = (
-    "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.onnx"
+    "https://github.com/bencevans/megadetector-onnx/releases/download/v0.1.0/md_v5a.0.0-dynamic.onnx"
 )
-# SHA256 for yolov5n.onnx from the official Ultralytics v7.0 release URL (verified 2026-04-22).
-DEFAULT_MODEL_SHA256 = "04f0e55c26f58d17145b36045780fe1250d5bd2187543e11568e5141d05b3262"
-DEFAULT_MODEL_CACHE_PATH = Path("~/.cache/wildlife-video-labeler/models/yolov5n.onnx")
+DEFAULT_MODEL_SHA256 = ""
+DEFAULT_MODEL_CACHE_PATH = Path("~/.cache/wildlife-video-labeler/models/md_v5a.0.0-dynamic.onnx")
 NORMALIZED_COORD_MAX_THRESHOLD = 2.0
 TRUSTED_MODEL_HOSTS = {"github.com", "raw.githubusercontent.com", "objects.githubusercontent.com"}
 VALID_MODES = {"label", "triage"}
 
-COCO_PERSON_CLASSES = {0}
-COCO_VEHICLE_CLASSES = {1, 2, 3, 5, 7}
-COCO_ANIMAL_CLASSES = {14, 15, 16, 17, 18, 19, 20, 21, 22, 23}
+# MegaDetector v5 outputs three classes (0-indexed).
+MEGADETECTOR_CLASS_NAMES = {0: "animal", 1: "person", 2: "vehicle"}
+MEGADETECTOR_NUM_CLASSES = len(MEGADETECTOR_CLASS_NAMES)  # 3
+# YOLOv5 output columns: 4 (bbox cx,cy,w,h) + 1 (objectness) + MEGADETECTOR_NUM_CLASSES
+MEGADETECTOR_COLUMNS = 5 + MEGADETECTOR_NUM_CLASSES  # 8
 
 
 def _onnx_tensor_input_dtype(numpy_module: object, onnx_type: str):
@@ -135,14 +145,8 @@ def relative_key(base_dir: Path, path: Path) -> str:
     return path.relative_to(base_dir).as_posix()
 
 
-def _category_for_coco_class(class_id: int) -> str | None:
-    if class_id in COCO_PERSON_CLASSES:
-        return "person"
-    if class_id in COCO_VEHICLE_CLASSES:
-        return "vehicle"
-    if class_id in COCO_ANIMAL_CLASSES:
-        return "animal"
-    return None
+def _category_for_megadetector_class(class_id: int) -> str | None:
+    return MEGADETECTOR_CLASS_NAMES.get(class_id)
 
 
 def _now_utc_iso() -> str:
@@ -176,10 +180,21 @@ def _ensure_model_file(model_path: Path, model_url: str, model_sha256: str) -> P
                 raise ValueError(
                     f"Model checksum mismatch at {resolved}: expected {expected_sha}, got {actual_sha}"
                 )
+        else:
+            print(
+                f"Warning: using cached model at {resolved} without SHA256 verification.\n"
+                f"Run: sha256sum {resolved}  and re-run with --model-sha256 <hash> to enable integrity checking."
+            )
         return resolved
 
     resolved.parent.mkdir(parents=True, exist_ok=True)
     print(f"Downloading model to {resolved} ...")
+    if not expected_sha:
+        print(
+            "Warning: --model-sha256 is not set. Integrity of the downloaded model will not be verified.\n"
+            f"After the download completes, run: sha256sum {resolved}\n"
+            "Then re-run with --model-sha256 <hash> to enable verification on future runs."
+        )
     with tempfile.NamedTemporaryFile(dir=resolved.parent, delete=False, suffix=".download") as temp_file:
         temp_path = Path(temp_file.name)
     try:
@@ -292,19 +307,17 @@ class _YoloOnnxDetector:
             predictions = np.squeeze(predictions, axis=0)
         if predictions.ndim != 2:
             return []
-        if predictions.shape[0] in {84, 85} and predictions.shape[1] > predictions.shape[0]:
+        # Handle [MEGADETECTOR_COLUMNS, N] layout by transposing to [N, MEGADETECTOR_COLUMNS].
+        if predictions.shape[0] == MEGADETECTOR_COLUMNS and predictions.shape[1] > MEGADETECTOR_COLUMNS:
             predictions = predictions.T
-        if predictions.shape[1] < 84:
+        if predictions.shape[1] != MEGADETECTOR_COLUMNS:
             return []
 
         boxes_xywh = predictions[:, :4]
-        if predictions.shape[1] == 85:
-            class_scores = predictions[:, 5:]
-            objectness = predictions[:, 4]
-            scores = class_scores * objectness[:, np.newaxis]
-        else:
-            class_scores = predictions[:, 4:]
-            scores = class_scores
+        # MegaDetector v5 uses YOLOv5 format: col 4 = objectness, cols 5: = class scores.
+        class_scores = predictions[:, 5:]
+        objectness = predictions[:, 4]
+        scores = class_scores * objectness[:, np.newaxis]
 
         class_ids = np.argmax(scores, axis=1)
         confidences = np.max(scores, axis=1)
@@ -322,7 +335,7 @@ class _YoloOnnxDetector:
         detections: List[Dict[str, float | int | str]] = []
         for output_index, keep_index in enumerate(keep_indices):
             class_id = int(class_ids[keep_index])
-            category = _category_for_coco_class(class_id)
+            category = _category_for_megadetector_class(class_id)
             if not category:
                 continue
             detections.append(
@@ -432,7 +445,7 @@ def run_triage_session(
     model_path: Path,
     model_url: str,
     model_sha256: str,
-    frame_scale_width: int = 640,
+    frame_scale_width: int = 1280,
 ) -> int:
     videos = find_video_files(input_dir)
     total = len(videos)
@@ -689,13 +702,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     triage_parser.add_argument(
         "--model-sha256",
         default=DEFAULT_MODEL_SHA256,
-        help="Triage mode expected SHA256 for downloaded model",
+        help=(
+            "Triage mode expected SHA256 for downloaded model (default: empty, integrity check skipped). "
+            "Provide your locally verified hash to enable integrity checking on future runs."
+        ),
     )
     triage_parser.add_argument(
         "--model-path",
         type=Path,
         default=DEFAULT_MODEL_CACHE_PATH,
-        help="Triage mode local ONNX model path (default: ~/.cache/wildlife-video-labeler/models/yolov5n.onnx)",
+        help="Triage mode local ONNX model path (default: ~/.cache/wildlife-video-labeler/models/md_v5a.0.0-dynamic.onnx)",
     )
     return parser.parse_args(args_list)
 
