@@ -14,7 +14,7 @@ import urllib.request
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, Iterable, List, Sequence
 
 VIDEO_EXTENSIONS = {".avi", ".mov", ".mp4", ".m4v", ".mts", ".mkv"}
 DEFAULT_MODEL_URL = (
@@ -41,12 +41,23 @@ def _onnx_tensor_input_dtype(numpy_module: object, onnx_type: str):
     return getattr(numpy_module, dtype_name, numpy_module.float32)
 
 
-def _compute_area_ratios(widths: Sequence[float], heights: Sequence[float], input_size: int) -> List[float]:
-    width_values = [abs(float(width)) for width in widths]
-    height_values = [abs(float(height)) for height in heights]
+def _compute_area_ratios(widths: Iterable[float], heights: Iterable[float], input_size: int) -> List[float]:
+    width_values: List[float] = []
+    max_width = 0.0
+    for width in widths:
+        value = abs(float(width))
+        width_values.append(value)
+        if value > max_width:
+            max_width = value
 
-    max_width = max(width_values, default=0.0)
-    max_height = max(height_values, default=0.0)
+    height_values: List[float] = []
+    max_height = 0.0
+    for height in heights:
+        value = abs(float(height))
+        height_values.append(value)
+        if value > max_height:
+            max_height = value
+
     if max_width <= NORMALIZED_COORD_MAX_THRESHOLD and max_height <= NORMALIZED_COORD_MAX_THRESHOLD:
         return [width * height for width, height in zip(width_values, height_values)]
 
