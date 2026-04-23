@@ -14,7 +14,7 @@ import urllib.request
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, Iterable, List, Sequence
 
 VIDEO_EXTENSIONS = {".avi", ".mov", ".mp4", ".m4v", ".mts", ".mkv"}
 DEFAULT_MODEL_URL = (
@@ -39,6 +39,30 @@ def _onnx_tensor_input_dtype(numpy_module: object, onnx_type: str):
         "tensor(double)": "float64",
     }.get(onnx_type, "float32")
     return getattr(numpy_module, dtype_name, numpy_module.float32)
+
+
+def _compute_area_ratios(widths: Iterable[float], heights: Iterable[float], input_size: int) -> List[float]:
+    width_values: List[float] = []
+    max_width = 0.0
+    for width in widths:
+        value = abs(float(width))
+        width_values.append(value)
+        if value > max_width:
+            max_width = value
+
+    height_values: List[float] = []
+    max_height = 0.0
+    for height in heights:
+        value = abs(float(height))
+        height_values.append(value)
+        if value > max_height:
+            max_height = value
+
+    if max_width <= NORMALIZED_COORD_MAX_THRESHOLD and max_height <= NORMALIZED_COORD_MAX_THRESHOLD:
+        return [width * height for width, height in zip(width_values, height_values)]
+
+    area_scale = float(input_size * input_size)
+    return [(width * height) / area_scale for width, height in zip(width_values, height_values)]
 
 
 def find_video_files(input_dir: Path) -> List[Path]:
@@ -289,16 +313,11 @@ class _YoloOnnxDetector:
         if keep_indices.size == 0:
             return []
 
-        widths = np.abs(boxes_xywh[keep_indices, 2])
-        heights = np.abs(boxes_xywh[keep_indices, 3])
+        widths = boxes_xywh[keep_indices, 2]
+        heights = boxes_xywh[keep_indices, 3]
         # Some ONNX exports produce normalized box sizes (~0..1), others use input-pixel units.
         # Heuristic: sizes <= 2.0 are treated as normalized to tolerate slight overshoot from quantization.
-        max_width = np.max(widths, initial=0.0)
-        max_height = np.max(heights, initial=0.0)
-        if max_width <= NORMALIZED_COORD_MAX_THRESHOLD and max_height <= NORMALIZED_COORD_MAX_THRESHOLD:
-            area_ratios = widths * heights
-        else:
-            area_ratios = (widths * heights) / float(self._input_size * self._input_size)
+        area_ratios = _compute_area_ratios(widths=widths, heights=heights, input_size=self._input_size)
 
         detections: List[Dict[str, float | int | str]] = []
         for output_index, keep_index in enumerate(keep_indices):
